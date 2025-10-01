@@ -4,11 +4,11 @@ import React, { useMemo, useState } from "react";
 import Papa from "papaparse";
 import { ethers } from "ethers";
 
-// === ENV VARIABLES (from Vercel) ===
-const AIRDROPPER = process.env.NEXT_PUBLIC_AIRDROPPER_ADDRESS;
-const TOKEN = process.env.NEXT_PUBLIC_TOKEN_ADDRESS;
+// ====== ENV (set on Vercel) ======
+const AIRDROPPER = process.env.NEXT_PUBLIC_AIRDROPPER_ADDRESS; // 0x...
+const TOKEN = process.env.NEXT_PUBLIC_TOKEN_ADDRESS;           // 0x...
 
-// === ABIs ===
+// ====== Minimal ABIs ======
 const AIRDROPPER_ABI = [
   "function airdrop(address[] recipients, uint256[] amounts) external",
   "function token() view returns (address)",
@@ -18,61 +18,57 @@ const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
 ];
 
-// --- Helper: pick MetaMask provider only ---
+// Pick the MetaMask provider even if multiple wallets inject window.ethereum
 function getMetaMaskProvider() {
   if (typeof window === "undefined") return null;
   const eth = window.ethereum;
   if (!eth) return null;
-
-  // If multiple providers exist, pick MetaMask
-  if (eth.providers && Array.isArray(eth.providers)) {
-    return eth.providers.find((p) => p && p.isMetaMask) || null;
+  if (Array.isArray(eth.providers)) {
+    const mm = eth.providers.find((p) => p && p.isMetaMask);
+    if (mm) return mm;
   }
-
   if (eth.isMetaMask) return eth;
   if (eth.provider && eth.provider.isMetaMask) return eth.provider;
-
   return null;
 }
 
 export default function Home() {
-  const [rows, setRows] = useState([]);
+  const [rows, setRows] = useState([]);         // [{address, amountStr}]
   const [status, setStatus] = useState("");
   const [txHash, setTxHash] = useState("");
   const [decimals, setDecimals] = useState(18);
-  const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [account, setAccount] = useState("");
 
   const totalTokens = useMemo(() => {
     try {
       return rows.reduce((sum, r) => sum + (parseFloat(r.amountStr || "0") || 0), 0);
-    } catch {
-      return 0;
-    }
+    } catch { return 0; }
   }, [rows]);
 
-  // --- Connect wallet ---
+  // ---------- Connect Wallet (MetaMask only) ----------
   async function connectWallet() {
     try {
+      // Guard: only in browser + require MetaMask
       const mm = getMetaMaskProvider();
       if (!mm) {
-        setStatus("MetaMask not detected. Please disable Phantom or click 'Use MetaMask' in the chooser.");
-        alert("Please click 'Use MetaMask' in the popup or disable Phantom for this site.");
+        setStatus("MetaMask not detected. If a chooser opens, pick 'Use MetaMask'.");
+        alert("Please choose 'Use MetaMask' in the wallet popup (or disable Phantom for this site) and try again.");
         return;
       }
 
+      // Use BrowserProvider with the MetaMask provider
       const provider = new ethers.BrowserProvider(mm);
+
+      // Request accounts
       await provider.send("eth_requestAccounts", []);
 
-      // ensure Sepolia (11155111)
+      // Ensure Sepolia (chainId 11155111)
       const SEPOLIA_HEX = "0xaa36a7";
       try {
-        await mm.request({
-          method: "wallet_switchEthereumChain",
-          params: [{ chainId: SEPOLIA_HEX }],
-        });
+        await mm.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA_HEX }] });
       } catch (e) {
+        // If chain not added, add then switch
         if (e && e.code === 4902) {
           await mm.request({
             method: "wallet_addEthereumChain",
@@ -92,6 +88,7 @@ export default function Home() {
       setConnected(true);
       setAccount(addr);
 
+      // Get token decimals (best effort)
       try {
         const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, signer);
         const dec = await erc20.decimals();
@@ -102,11 +99,13 @@ export default function Home() {
       }
     } catch (err) {
       console.error("Wallet connect error:", err);
-      setStatus("Failed to connect wallet. Please retry and ensure MetaMask is selected.");
+      // 4001 = user rejected
+      if (err && err.code === 4001) setStatus("Connection request was rejected in MetaMask.");
+      else setStatus("Failed to connect wallet. Please ensure MetaMask is selected.");
     }
   }
 
-  // --- CSV upload ---
+  // ---------- CSV Upload ----------
   function handleCSV(file) {
     if (!file) return;
     setStatus("Parsing CSV...");
@@ -126,6 +125,7 @@ export default function Home() {
           setRows(parsed);
           setStatus(`Parsed ${parsed.length} rows. Total: ${parsed.reduce((s, r) => s + Number(r.amountStr), 0)} tokens.`);
         } catch (e) {
+          console.error(e);
           setRows([]);
           setStatus(`CSV error: ${e.message}`);
         }
@@ -137,15 +137,20 @@ export default function Home() {
     });
   }
 
-  // --- Run airdrop ---
+  // ---------- Run Airdrop ----------
   async function runAirdrop() {
     try {
       if (!connected) return alert("Connect wallet first.");
       if (!rows.length) return alert("Upload a CSV first.");
+      if (!AIRDROPPER || !TOKEN) return alert("Env vars missing. Set NEXT_PUBLIC_* on Vercel.");
 
-      setLoading(true);
       setStatus("Preparing transaction...");
 
+      // Always re-create provider from current window.ethereum
+      if (typeof window === "undefined" || !window.ethereum) {
+        setStatus("MetaMask not detected in browser.");
+        return;
+      }
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
 
@@ -154,75 +159,76 @@ export default function Home() {
 
       const airdropper = new ethers.Contract(AIRDROPPER, AIRDROPPER_ABI, signer);
 
+      // Optional safety: check balance first
       const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, signer);
       const bal = await erc20.balanceOf(AIRDROPPER);
       const need = amounts.reduce((s, a) => s + a, 0n);
       if (bal < need) {
-        setLoading(false);
-        setStatus("Airdropper does not have enough tokens.");
+        setStatus("Airdropper does not have enough tokens. Please fund it first.");
         return;
       }
 
       setStatus("Sending transaction...");
       const tx = await airdropper.airdrop(recipients, amounts);
+      setStatus("Waiting for confirmation...");
       const rcpt = await tx.wait();
 
       setTxHash(tx.hash);
-      setStatus(`Success! Block ${rcpt.blockNumber}`);
+      setStatus(`Success! Confirmed in block ${rcpt.blockNumber}.`);
     } catch (e) {
-      console.error(e);
-      setStatus(e?.message || "Airdrop failed.");
-    } finally {
-      setLoading(false);
+      console.error("Airdrop error:", e);
+      setStatus(e?.shortMessage || e?.message || "Airdrop failed.");
     }
   }
 
   const etherscanBase = "https://sepolia.etherscan.io/tx/";
 
   return (
-    <main style={{ maxWidth: 780, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>CSV Airdrop Demo</h1>
-      <p style={{ opacity: 0.8, marginBottom: 16 }}>
+    <main style={{maxWidth: 780, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui"}}>
+      <h1 style={{fontSize: 28, fontWeight: 700, marginBottom: 12}}>CSV Airdrop Demo</h1>
+      <p style={{opacity: 0.8, marginBottom: 16}}>
         1) Connect wallet (Sepolia) → 2) Upload CSV (<code>address,amount</code>) → 3) Distribute
       </p>
 
-      <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-        <button onClick={connectWallet} disabled={connected} style={{ padding: "10px 14px", borderRadius: 10 }}>
+      <div style={{display:"flex", gap:12, marginBottom:16}}>
+        <button onClick={connectWallet} disabled={connected} style={{padding:"10px 14px", borderRadius:10}}>
           {connected ? "Wallet Connected" : "Connect MetaMask"}
         </button>
 
-        <label style={{ padding: "10px 14px", border: "1px dashed #999", borderRadius: 10, cursor: "pointer" }}>
+        <label style={{padding:"10px 14px", border:"1px dashed #999", borderRadius:10, cursor:"pointer"}}>
           Upload CSV
-          <input type="file" accept=".csv" onChange={(e) => handleCSV(e.target.files?.[0])} style={{ display: "none" }} />
+          <input type="file" accept=".csv" onChange={(e)=>handleCSV(e.target.files?.[0])} style={{display:"none"}} />
         </label>
 
-        <button onClick={runAirdrop} disabled={loading || !rows.length || !connected} style={{ padding: "10px 14px", borderRadius: 10 }}>
-          {loading ? "Sending..." : "Distribute"}
+        <button onClick={runAirdrop} disabled={!rows.length || !connected} style={{padding:"10px 14px", borderRadius:10}}>
+          Distribute
         </button>
       </div>
 
-      {status && <div><b>Status:</b> {status}</div>}
+      {status && <div style={{marginBottom:12}}><b>Status:</b> {status}</div>}
 
       {txHash && (
-        <div>
+        <div style={{marginBottom:12}}>
           <b>Tx:</b>{" "}
           <a href={etherscanBase + txHash} target="_blank" rel="noreferrer">
-            {txHash.slice(0, 10)}...{txHash.slice(-8)}
+            {txHash.slice(0,10)}...{txHash.slice(-8)}
           </a>
         </div>
       )}
 
       {!!rows.length && (
-        <div style={{ marginTop: 10 }}>
+        <div style={{marginTop: 10}}>
           <b>Preview ({rows.length} rows)</b>
-          <ul style={{ maxHeight: 260, overflow: "auto", paddingLeft: 18 }}>
+          <ul style={{maxHeight: 260, overflow: "auto", paddingLeft: 18}}>
             {rows.map((r, i) => (
-              <li key={i} style={{ fontFamily: "monospace" }}>
+              <li key={i} style={{fontFamily:"monospace"}}>
                 {r.address} , {r.amountStr}
               </li>
             ))}
           </ul>
-          <div>Total tokens: {totalTokens}</div>
+          <div style={{marginTop:8, opacity:0.8}}>
+            Total (entered): {totalTokens} tokens (sending with {decimals}-decimals)
+          </div>
         </div>
       )}
     </main>

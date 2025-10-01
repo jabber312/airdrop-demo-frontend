@@ -1,20 +1,21 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import Papa from "papaparse";
 import { ethers } from "ethers";
 
+// === ENV (set in Vercel) ===
 const AIRDROPPER = process.env.NEXT_PUBLIC_AIRDROPPER_ADDRESS;
 const TOKEN = process.env.NEXT_PUBLIC_TOKEN_ADDRESS;
 
-// Minimal ABIs we need
+// === Minimal ABIs ===
 const AIRDROPPER_ABI = [
   "function airdrop(address[] recipients, uint256[] amounts) external",
-  "function token() view returns (address)"
+  "function token() view returns (address)",
 ];
 const ERC20_ABI = [
   "function decimals() view returns (uint8)",
-  "function balanceOf(address) view returns (uint256)"
+  "function balanceOf(address) view returns (uint256)",
 ];
 
 export default function Home() {
@@ -29,32 +30,72 @@ export default function Home() {
   const totalTokens = useMemo(() => {
     try {
       return rows.reduce((sum, r) => sum + (parseFloat(r.amountStr || "0") || 0), 0);
-    } catch { return 0; }
+    } catch {
+      return 0;
+    }
   }, [rows]);
 
+  // --- Connect wallet + force Sepolia ---
   async function connectWallet() {
     try {
-      if (!window.ethereum) {
-        alert("MetaMask not found. Please install it.");
+      if (typeof window === "undefined" || !window.ethereum) {
+        setStatus("MetaMask not found. Please install it and refresh.");
+        alert("MetaMask not found. Install it and refresh this page.");
         return;
       }
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const accounts = await provider.send("eth_requestAccounts", []);
-      setAccount(accounts[0] || "");
-      setConnected(true);
 
-      // Fetch token decimals for correct unit conversion
+      const provider = new ethers.BrowserProvider(window.ethereum);
+
+      // ask for account access
+      await provider.send("eth_requestAccounts", []);
+
+      // ensure Sepolia
+      const SEPOLIA_HEX = "0xaa36a7"; // 11155111
+      try {
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: SEPOLIA_HEX }],
+        });
+      } catch (e) {
+        if (e && e.code === 4902) {
+          // Add chain then switch
+          await window.ethereum.request({
+            method: "wallet_addEthereumChain",
+            params: [
+              {
+                chainId: SEPOLIA_HEX,
+                chainName: "Sepolia",
+                nativeCurrency: { name: "SepoliaETH", symbol: "SEP", decimals: 18 },
+                rpcUrls: ["https://rpc.sepolia.org"],
+                blockExplorerUrls: ["https://sepolia.etherscan.io"],
+              },
+            ],
+          });
+        }
+      }
+
       const signer = await provider.getSigner();
+      const addr = await signer.getAddress();
+      setConnected(true);
+      setAccount(addr);
+
+      // fetch token decimals (for parseUnits)
       const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, signer);
       const dec = await erc20.decimals();
       setDecimals(Number(dec));
-      setStatus(`Connected: ${accounts[0]?.slice(0,6)}...${accounts[0]?.slice(-4)} | Token decimals: ${dec}`);
-    } catch (e) {
-      console.error(e);
-      setStatus("Failed to connect wallet.");
+
+      setStatus(`Connected: ${addr.slice(0, 6)}...${addr.slice(-4)} | Token decimals: ${dec}`);
+    } catch (err) {
+      console.error("Wallet connect error:", err);
+      if (err && err.code === 4001) {
+        setStatus("Connection request was rejected in MetaMask.");
+      } else {
+        setStatus("Failed to connect wallet.");
+      }
     }
   }
 
+  // --- CSV upload handler ---
   function handleCSV(file) {
     if (!file) return;
     setStatus("Parsing CSV...");
@@ -63,21 +104,22 @@ export default function Home() {
       skipEmptyLines: true,
       complete: (res) => {
         try {
-          // Expect exactly 2 columns: address, amount
           const parsed = res.data.map((row, idx) => {
-            if (!Array.isArray(row) || row.length < 2) throw new Error(`Row ${idx+1} malformed`);
+            if (!Array.isArray(row) || row.length < 2) {
+              throw new Error(`Row ${idx + 1} malformed`);
+            }
             const address = String(row[0]).trim();
             const amountStr = String(row[1]).trim();
             if (!ethers.isAddress(address)) {
-              throw new Error(`Invalid address at row ${idx+1}: ${address}`);
+              throw new Error(`Invalid address at row ${idx + 1}: ${address}`);
             }
             if (isNaN(Number(amountStr)) || Number(amountStr) <= 0) {
-              throw new Error(`Invalid amount at row ${idx+1}: ${amountStr}`);
+              throw new Error(`Invalid amount at row ${idx + 1}: ${amountStr}`);
             }
             return { address, amountStr };
           });
           setRows(parsed);
-          setStatus(`Parsed ${parsed.length} rows. Total: ${totalTokens} tokens.`);
+          setStatus(`Parsed ${parsed.length} rows. Total: ${parsed.reduce((s, r) => s + Number(r.amountStr), 0)} tokens.`);
         } catch (e) {
           console.error(e);
           setRows([]);
@@ -87,19 +129,16 @@ export default function Home() {
       error: (err) => {
         console.error(err);
         setStatus("CSV parse failed.");
-      }
+      },
     });
   }
 
+  // --- Call airdrop ---
   async function runAirdrop() {
     try {
       if (!connected) return alert("Connect wallet first.");
       if (!rows.length) return alert("Upload a CSV first.");
-
-      // Limit batch size for demo safety
-      if (rows.length > 200) {
-        return alert("Please keep CSV <= 200 rows for this demo.");
-      }
+      if (rows.length > 200) return alert("Please keep CSV <= 200 rows for this demo.");
 
       setLoading(true);
       setStatus("Preparing transaction...");
@@ -107,19 +146,19 @@ export default function Home() {
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
 
-      // Prepare arrays
-      const recipients = rows.map(r => r.address);
-      const amounts = rows.map(r => ethers.parseUnits(r.amountStr, decimals)); // convert to token units
+      const recipients = rows.map((r) => r.address);
+      const amounts = rows.map((r) => ethers.parseUnits(r.amountStr, decimals));
 
       const airdropper = new ethers.Contract(AIRDROPPER, AIRDROPPER_ABI, signer);
 
-      // Optional: quick balance check
+      // Optional: check the contract has enough tokens
       const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, signer);
       const bal = await erc20.balanceOf(AIRDROPPER);
       const need = amounts.reduce((s, a) => s + a, 0n);
       if (bal < need) {
         setLoading(false);
-        return setStatus("Airdropper does not have enough tokens. Fund it first.");
+        setStatus("Airdropper does not have enough tokens. Fund it first.");
+        return;
       }
 
       setStatus("Sending transaction...");
@@ -140,48 +179,54 @@ export default function Home() {
   const etherscanBase = "https://sepolia.etherscan.io/tx/";
 
   return (
-    <main style={{maxWidth: 780, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui"}}>
-      <h1 style={{fontSize: 28, fontWeight: 700, marginBottom: 12}}>CSV Airdrop Demo</h1>
-      <p style={{opacity: 0.8, marginBottom: 16}}>
+    <main style={{ maxWidth: 780, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
+      <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>CSV Airdrop Demo</h1>
+      <p style={{ opacity: 0.8, marginBottom: 16 }}>
         1) Connect wallet (Sepolia) → 2) Upload CSV (<code>address,amount</code>) → 3) Distribute
       </p>
 
-      <div style={{display:"flex", gap:12, marginBottom:16}}>
-        <button onClick={connectWallet} disabled={connected} style={{padding:"10px 14px", borderRadius:10}}>
+      <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+        <button onClick={connectWallet} disabled={connected} style={{ padding: "10px 14px", borderRadius: 10 }}>
           {connected ? "Wallet Connected" : "Connect MetaMask"}
         </button>
-        <label style={{padding:"10px 14px", border:"1px dashed #999", borderRadius:10, cursor:"pointer"}}>
+
+        <label style={{ padding: "10px 14px", border: "1px dashed #999", borderRadius: 10, cursor: "pointer" }}>
           Upload CSV
-          <input type="file" accept=".csv" onChange={(e)=>handleCSV(e.target.files?.[0])} style={{display:"none"}} />
+          <input type="file" accept=".csv" onChange={(e) => handleCSV(e.target.files?.[0])} style={{ display: "none" }} />
         </label>
-        <button onClick={runAirdrop} disabled={loading || !rows.length || !connected} style={{padding:"10px 14px", borderRadius:10}}>
+
+        <button onClick={runAirdrop} disabled={loading || !rows.length || !connected} style={{ padding: "10px 14px", borderRadius: 10 }}>
           {loading ? "Sending..." : "Distribute"}
         </button>
       </div>
 
-      {status && <div style={{marginBottom:12}}><b>Status:</b> {status}</div>}
+      {status && (
+        <div style={{ marginBottom: 12 }}>
+          <b>Status:</b> {status}
+        </div>
+      )}
 
       {txHash && (
-        <div style={{marginBottom:12}}>
+        <div style={{ marginBottom: 12 }}>
           <b>Tx:</b>{" "}
           <a href={etherscanBase + txHash} target="_blank" rel="noreferrer">
-            {txHash.slice(0,10)}...{txHash.slice(-8)}
+            {txHash.slice(0, 10)}...{txHash.slice(-8)}
           </a>
         </div>
       )}
 
       {!!rows.length && (
-        <div style={{marginTop: 10}}>
+        <div style={{ marginTop: 10 }}>
           <b>Preview ({rows.length} rows)</b>
-          <ul style={{maxHeight: 260, overflow: "auto", paddingLeft: 18}}>
+          <ul style={{ maxHeight: 260, overflow: "auto", paddingLeft: 18 }}>
             {rows.map((r, i) => (
-              <li key={i} style={{fontFamily:"monospace"}}>
+              <li key={i} style={{ fontFamily: "monospace" }}>
                 {r.address} , {r.amountStr}
               </li>
             ))}
           </ul>
-          <div style={{marginTop:8, opacity:0.8}}>
-            Total (entered): {totalTokens} tokens (will be sent using {decimals}-decimals)
+          <div style={{ marginTop: 8, opacity: 0.8 }}>
+            Total (entered): {totalTokens} tokens (sending with {decimals}-decimals)
           </div>
         </div>
       )}

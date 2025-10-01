@@ -1,14 +1,20 @@
-// next.config.ts
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  eslint: {
-    // Let production builds complete even if ESLint finds issues
-    ignoreDuringBuilds: true,
-  },
-  typescript: {
-    // Let production builds complete even if there are TS errors
-    ignoreBuildErrors: true,
+  reactStrictMode: true,
+  async headers() {
+    return [
+      {
+        source: "/(.*)", // Apply headers to all routes
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            // Allow ethers.js + MetaMask to work
+            value: "script-src 'self' 'unsafe-eval'; object-src 'none'; base-uri 'self';",
+          },
+        ],
+      },
+    ];
   },
 };
 

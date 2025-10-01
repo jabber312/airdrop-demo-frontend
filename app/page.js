@@ -5,8 +5,9 @@ import Papa from "papaparse";
 import { ethers } from "ethers";
 
 /** ====== ENV (PUBLIC) ====== */
-const AIRDROPPER = process.env.NEXT_PUBLIC_AIRDROPPER_ADDRESS; // 0x...
-const TOKEN      = process.env.NEXT_PUBLIC_TOKEN_ADDRESS;      // 0x...
+/* Strip ALL whitespace/newlines to avoid ENS error */
+const AIRDROPPER = (process.env.NEXT_PUBLIC_AIRDROPPER_ADDRESS || "").replace(/\s+/g, "");
+const TOKEN      = (process.env.NEXT_PUBLIC_TOKEN_ADDRESS || "").replace(/\s+/g, "");
 
 /** ====== ABIs ====== */
 const AIRDROPPER_ABI = [
@@ -32,19 +33,20 @@ function getMetaMask() {
 }
 
 export default function Home() {
-  const [rows, setRows] = useState([]);               // [{address, amountStr}]
-  const [status, setStatus] = useState("");
-  const [txHash, setTxHash] = useState("");
-  const [decimals, setDecimals] = useState(18);
-  const [connected, setConnected] = useState(false);
-  const [account, setAccount] = useState("");
+  const [rows, setRows] = useState([]);               // Parsed CSV rows
+  const [status, setStatus] = useState("");           // Status message
+  const [txHash, setTxHash] = useState("");           // Transaction hash
+  const [decimals, setDecimals] = useState(18);       // Token decimals
+  const [connected, setConnected] = useState(false);  // Wallet connection state
+  const [account, setAccount] = useState("");         // Connected account
 
+  // Compute total tokens from CSV
   const totalTokens = useMemo(
     () => rows.reduce((s, r) => s + (parseFloat(r.amountStr || "0") || 0), 0),
     [rows]
   );
 
-  /** ---------- Connect MetaMask (ONLY) ---------- */
+  /** ---------- Step 1: Connect MetaMask ---------- */
   async function connectWallet() {
     try {
       // 1) Must be in browser and MetaMask present
@@ -55,14 +57,14 @@ export default function Home() {
         return;
       }
 
-      // 2) Ask for accounts FIRST (this triggers the popup)
+      // 2) Ask for accounts FIRST (this triggers the MetaMask popup)
       const accounts = await mm.request({ method: "eth_requestAccounts" });
       if (!accounts || !accounts.length) {
         setStatus("No account authorized in MetaMask.");
         return;
       }
 
-      // 3) Ensure network = Sepolia (11155111)
+      // 3) Ensure network = Sepolia (chainId 11155111)
       const SEPOLIA_HEX = "0xaa36a7";
       try {
         await mm.request({
@@ -70,6 +72,7 @@ export default function Home() {
           params: [{ chainId: SEPOLIA_HEX }],
         });
       } catch (e) {
+        // If Sepolia is not added, add it
         if (e && e.code === 4902) {
           await mm.request({
             method: "wallet_addEthereumChain",
@@ -86,7 +89,7 @@ export default function Home() {
         }
       }
 
-      // 4) Create an ethers provider/signer AFTER accounts approved
+      // 4) Create ethers provider & signer AFTER accounts approved
       const provider = new ethers.BrowserProvider(mm);
       const signer = await provider.getSigner();
       const addr = await signer.getAddress();
@@ -114,7 +117,7 @@ export default function Home() {
     }
   }
 
-  /** ---------- CSV Upload ---------- */
+  /** ---------- Step 2: Upload & Parse CSV ---------- */
   function handleCSV(file) {
     if (!file) return;
     setStatus("Parsing CSV...");
@@ -145,7 +148,7 @@ export default function Home() {
     });
   }
 
-  /** ---------- Run Airdrop ---------- */
+  /** ---------- Step 3: Run Airdrop ---------- */
   async function runAirdrop() {
     try {
       if (!connected) return alert("Connect wallet first.");
@@ -163,12 +166,13 @@ export default function Home() {
       const recipients = rows.map(r => r.address);
       const amounts = rows.map(r => ethers.parseUnits(r.amountStr, decimals));
 
-      // Safety: enough tokens loaded?
+      // Safety check: ensure the airdropper contract has enough tokens
       const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, signer);
       const bal = await erc20.balanceOf(AIRDROPPER);
       const need = amounts.reduce((s, a) => s + a, 0n);
       if (bal < need) { setStatus("Airdropper does not have enough tokens."); return; }
 
+      // Call airdrop contract
       const airdropper = new ethers.Contract(AIRDROPPER, AIRDROPPER_ABI, signer);
       setStatus("Sending transaction...");
       const tx = await airdropper.airdrop(recipients, amounts);
@@ -185,6 +189,7 @@ export default function Home() {
 
   const etherscanBase = "https://sepolia.etherscan.io/tx/";
 
+  /** ---------- Render UI ---------- */
   return (
     <main style={{ maxWidth: 780, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
       <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>CSV Airdrop Demo</h1>
